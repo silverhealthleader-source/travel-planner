@@ -1,0 +1,18 @@
+# 실제 API 키 파일
+.env
+
+# Python 가상환경
+.venv/
+venv/
+
+# Python 임시 파일
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code 설정
+.vscode/
+
+# 운영체제 임시 파일
+.DS_Store
+Thumbs.db
