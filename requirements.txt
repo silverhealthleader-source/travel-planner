@@ -1,4 +1,4 @@
-google-genai
-requests
-python-dotenv
-pydantic
+﻿google-genai==2.18.1
+pydantic==2.13.4
+python-dotenv==1.2.3
+requests==2.34.2
