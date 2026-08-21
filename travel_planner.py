@@ -22,12 +22,8 @@ class TravelRecommendation(BaseModel):
     weather: str = Field(
         description="입력한 여행 시기의 일반적인 예상 날씨와 옷차림"
     )
-    events: list[str] = Field(
-        description="행사 또는 축제 후보 목록"
-    )
-    reason: str = Field(
-        description="해당 지역을 추천하는 이유"
-    )
+    events: list[str] = Field(description="행사 또는 축제 후보 목록")
+    reason: str = Field(description="해당 지역을 추천하는 이유")
 
 
 class Restaurant(BaseModel):
@@ -70,8 +66,7 @@ def load_api_key(variable_name: str) -> str:
 def create_gemini_client() -> genai.Client:
     """Gemini API 클라이언트를 만든다."""
 
-    gemini_api_key = load_api_key("GEMINI_API_KEY")
-    return genai.Client(api_key=gemini_api_key)
+    return genai.Client(api_key=load_api_key("GEMINI_API_KEY"))
 
 
 def recommend_destination(
@@ -98,7 +93,6 @@ def recommend_destination(
 
     last_error: Exception | None = None
 
-    # 최초 요청이 실패하면 한 번만 더 요청합니다.
     for attempt in range(1, 3):
         try:
             response = client.models.generate_content(
@@ -114,10 +108,7 @@ def recommend_destination(
             if not response.text:
                 raise ValueError("Gemini 응답 내용이 비어 있습니다.")
 
-            return TravelRecommendation.model_validate_json(
-                response.text
-            )
-
+            return TravelRecommendation.model_validate_json(response.text)
         except (ValidationError, ValueError) as error:
             last_error = error
 
@@ -133,13 +124,8 @@ def search_restaurants(city: str) -> list[Restaurant]:
     """추천 도시의 음식점 5곳을 Kakao Local API로 검색한다."""
 
     kakao_api_key = load_api_key("KAKAO_REST_API_KEY")
-
     url = "https://dapi.kakao.com/v2/local/search/keyword.json"
-
-    headers = {
-        "Authorization": f"KakaoAK {kakao_api_key}"
-    }
-
+    headers = {"Authorization": f"KakaoAK {kakao_api_key}"}
     params = {
         "query": f"{city} 맛집",
         "category_group_code": "FD6",
@@ -160,37 +146,65 @@ def search_restaurants(city: str) -> list[Restaurant]:
             f"Kakao Local API 요청에 실패했습니다: {error}"
         ) from error
 
-    response_data = response.json()
-    documents = response_data.get("documents", [])
-
+    documents = response.json().get("documents", [])
     restaurants: list[Restaurant] = []
 
     for document in documents:
-        restaurant = Restaurant(
-            name=document.get("place_name", "이름 없음"),
-            category=document.get("category_name", "분류 없음"),
-            phone=document.get("phone") or "전화번호 없음",
-            address=document.get("address_name") or "주소 없음",
-            road_address=(
-                document.get("road_address_name")
-                or document.get("address_name")
-                or "주소 없음"
-            ),
-            place_url=document.get("place_url") or "링크 없음",
+        restaurants.append(
+            Restaurant(
+                name=document.get("place_name", "이름 없음"),
+                category=document.get("category_name", "분류 없음"),
+                phone=document.get("phone") or "전화번호 없음",
+                address=document.get("address_name") or "주소 없음",
+                road_address=(
+                    document.get("road_address_name")
+                    or document.get("address_name")
+                    or "주소 없음"
+                ),
+                place_url=document.get("place_url") or "링크 없음",
+            )
         )
-        restaurants.append(restaurant)
 
     if not restaurants:
-        raise RuntimeError(
-            f"'{city} 맛집' 검색 결과가 없습니다."
-        )
+        raise RuntimeError(f"'{city} 맛집' 검색 결과가 없습니다.")
 
     return restaurants
 
 
-def print_recommendation(
-    recommendation: TravelRecommendation,
-) -> None:
+def load_cached_results(
+    travel_date: str,
+) -> tuple[TravelRecommendation, list[Restaurant]] | None:
+    """같은 날짜의 원본 JSON이 있으면 검증 후 캐시 결과를 반환한다."""
+
+    json_path = Path("results") / f"travel_plan_{travel_date}.json"
+
+    if not json_path.exists():
+        return None
+
+    try:
+        result_data = json.loads(json_path.read_text(encoding="utf-8"))
+
+        if result_data.get("travel_date") != travel_date:
+            raise ValueError("캐시 파일의 여행 날짜가 일치하지 않습니다.")
+
+        recommendation = TravelRecommendation.model_validate(
+            result_data["recommendation"]
+        )
+        restaurants = [
+            Restaurant.model_validate(item)
+            for item in result_data["restaurants"]
+        ]
+
+        if not restaurants:
+            raise ValueError("캐시 파일에 음식점 결과가 없습니다.")
+
+        return recommendation, restaurants
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, ValidationError) as error:
+        print(f"저장된 JSON을 사용할 수 없어 API를 다시 호출합니다: {error}")
+        return None
+
+
+def print_recommendation(recommendation: TravelRecommendation) -> None:
     """Gemini 여행지 추천 결과를 출력한다."""
 
     print("\n[1단계: Gemini 여행지 추천 결과]")
@@ -198,10 +212,7 @@ def print_recommendation(
     print(f"예상 날씨: {recommendation.weather}")
     print("행사·축제 후보:")
 
-    for number, event in enumerate(
-        recommendation.events,
-        start=1,
-    ):
+    for number, event in enumerate(recommendation.events, start=1):
         print(f"  {number}. {event}")
 
     print(f"추천 이유: {recommendation.reason}")
@@ -215,15 +226,13 @@ def print_restaurants(
 
     print(f"\n[2단계: Kakao Local API {city} 음식점 검색 결과]")
 
-    for number, restaurant in enumerate(
-        restaurants,
-        start=1,
-    ):
+    for number, restaurant in enumerate(restaurants, start=1):
         print(f"\n{number}. {restaurant.name}")
         print(f"   분류: {restaurant.category}")
         print(f"   전화: {restaurant.phone}")
         print(f"   주소: {restaurant.road_address}")
         print(f"   지도: {restaurant.place_url}")
+
 
 def save_results(
     travel_date: str,
@@ -238,24 +247,14 @@ def save_results(
     result_data = {
         "travel_date": travel_date,
         "recommendation": recommendation.model_dump(),
-        "restaurants": [
-            restaurant.model_dump()
-            for restaurant in restaurants
-        ],
+        "restaurants": [item.model_dump() for item in restaurants],
     }
 
     json_path = results_directory / f"travel_plan_{travel_date}.json"
-    markdown_path = (
-        results_directory / f"travel_plan_{travel_date}.md"
-    )
+    markdown_path = results_directory / f"travel_plan_{travel_date}.md"
 
-    json_text = json.dumps(
-        result_data,
-        ensure_ascii=False,
-        indent=2,
-    )
     json_path.write_text(
-        json_text,
+        json.dumps(result_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -276,17 +275,10 @@ def save_results(
         markdown_lines.append(f"- {event}")
 
     markdown_lines.extend(
-        [
-            "",
-            "## 2. Kakao Local API 음식점 검색 결과",
-            "",
-        ]
+        ["", "## 2. Kakao Local API 음식점 검색 결과", ""]
     )
 
-    for number, restaurant in enumerate(
-        restaurants,
-        start=1,
-    ):
+    for number, restaurant in enumerate(restaurants, start=1):
         markdown_lines.extend(
             [
                 f"### {number}. {restaurant.name}",
@@ -299,14 +291,13 @@ def save_results(
             ]
         )
 
-    markdown_text = "\n".join(markdown_lines)
-
     markdown_path.write_text(
-        markdown_text,
+        "\n".join(markdown_lines),
         encoding="utf-8",
     )
 
     return json_path, markdown_path
+
 
 def main() -> None:
     """CLI 입력을 받아 여행지와 음식점을 추천한다."""
@@ -321,28 +312,32 @@ def main() -> None:
         type=validate_date,
         help="여행 날짜를 YYYY-MM-DD 형식으로 입력하세요.",
     )
-
     args = parser.parse_args()
 
     print("국내 여행 추천 프로그램")
     print(f"입력한 여행 날짜: {args.date}")
-    print("Gemini가 여행지를 추천하고 있습니다.")
 
     try:
-        client = create_gemini_client()
+        cached_results = load_cached_results(args.date)
 
-        recommendation = recommend_destination(
-            client,
-            args.date,
-        )
+        if cached_results is not None:
+            print("저장된 원본 JSON을 발견했습니다.")
+            print("Gemini와 Kakao Local API 호출을 건너뜁니다.")
+            recommendation, restaurants = cached_results
+        else:
+            print("저장된 결과가 없어 API를 호출합니다.")
+            print("Gemini가 여행지를 추천하고 있습니다.")
+            client = create_gemini_client()
+            recommendation = recommend_destination(client, args.date)
+            city = recommendation.recommended_city
+            print(f"\nKakao에서 '{city} 맛집'을 검색하고 있습니다.")
+            restaurants = search_restaurants(city)
+
         print_recommendation(recommendation)
-
-        city = recommendation.recommended_city
-
-        print(f"\nKakao에서 '{city} 맛집'을 검색하고 있습니다.")
-
-        restaurants = search_restaurants(city)
-        print_restaurants(city, restaurants)
+        print_restaurants(
+            recommendation.recommended_city,
+            restaurants,
+        )
         json_path, markdown_path = save_results(
             args.date,
             recommendation,
@@ -351,7 +346,7 @@ def main() -> None:
 
         print("\n[3단계: 결과 파일 저장 완료]")
         print(f"JSON 파일: {json_path}")
-        print(f"Markdown 파일: {markdown_path}")        
+        print(f"Markdown 파일: {markdown_path}")
     except Exception as error:
         print(f"\n오류가 발생했습니다: {error}")
         raise SystemExit(1) from error
