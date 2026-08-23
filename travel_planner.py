@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 import requests
 from dotenv import load_dotenv
@@ -39,6 +40,127 @@ class Restaurant(BaseModel):
     y: float | None = None
 
 
+def normalize_city_keyword(city: str) -> str:
+    """행정구역이 포함된 추천 지역명을 장소 검색용 중심 키워드로 정규화한다."""
+
+    normalized_city = " ".join(city.strip().split())
+
+    if not normalized_city:
+        raise ValueError("추천 도시명이 비어 있습니다.")
+
+    tokens = normalized_city.split()
+
+    # 여러 행정구역이 함께 오면 시·군을 우선해 검색 중심 지역을 선택한다.
+    for suffix in ("특별자치시", "특별시", "광역시", "시", "군"):
+        for token in reversed(tokens):
+            if token.endswith(suffix) and len(token) > len(suffix):
+                return token[: -len(suffix)]
+
+    # 시·군이 없고 구만 있는 경우 구 이름을 검색어로 사용한다.
+    for token in reversed(tokens):
+        if token.endswith("구") and len(token) > 1:
+            return token[:-1]
+
+    # 단일 광역 행정구역명은 긴 접미사부터 제거한다.
+    last_token = tokens[-1]
+    for suffix in ("특별자치도", "특별자치시", "특별시", "광역시", "도"):
+        if last_token.endswith(suffix) and len(last_token) > len(suffix):
+            return last_token[: -len(suffix)]
+
+    return last_token
+
+
+class MapSearchAdapter(Protocol):
+    """지도 서비스가 제공해야 하는 음식점 검색 계약."""
+
+    def search_restaurants(self, city: str) -> list[Restaurant]:
+        """도시명을 받아 표준 Restaurant 목록을 반환한다."""
+
+        ...
+
+
+class KakaoLocalAdapter:
+    """Kakao Local API를 MapSearchAdapter 계약에 맞춘 구현체."""
+
+    endpoint = "https://dapi.kakao.com/v2/local/search/keyword.json"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        timeout: int = 10,
+    ) -> None:
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def search_restaurants(self, city: str) -> list[Restaurant]:
+        """정규화된 도시 키워드로 Kakao 음식점 5곳을 검색한다."""
+
+        search_city = normalize_city_keyword(city)
+        kakao_api_key = self.api_key or load_api_key("KAKAO_REST_API_KEY")
+        headers = {"Authorization": f"KakaoAK {kakao_api_key}"}
+        params = {
+            "query": f"{search_city} 맛집",
+            "category_group_code": "FD6",
+            "size": 5,
+            "sort": "accuracy",
+        }
+
+        try:
+            response = requests.get(
+                self.endpoint,
+                headers=headers,
+                params=params,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+        except requests.Timeout as error:
+            raise RuntimeError(
+                "Kakao Local API 요청 시간이 초과되었습니다. 네트워크 상태를 확인하세요."
+            ) from error
+        except requests.HTTPError as error:
+            status_code = (
+                error.response.status_code
+                if error.response is not None
+                else None
+            )
+
+            if status_code == 401:
+                message = "Kakao Local API 인증에 실패했습니다(401). REST API 키와 Authorization 헤더를 확인하세요."
+            elif status_code == 403:
+                message = "Kakao Local API 접근이 거부되었습니다(403). 앱 권한과 사용 가능한 API 설정을 확인하세요."
+            else:
+                message = f"Kakao Local API가 HTTP 오류를 반환했습니다: {error}"
+
+            raise RuntimeError(message) from error
+        except requests.RequestException as error:
+            raise RuntimeError(
+                f"Kakao Local API 연결에 실패했습니다: {error}"
+            ) from error
+
+        documents = response.json().get("documents", [])
+        restaurants: list[Restaurant] = []
+
+        for document in documents:
+            restaurants.append(
+                Restaurant(
+                    name=document.get("place_name", "이름 없음"),
+                    category=document.get("category_name", "분류 없음"),
+                    phone=document.get("phone") or "전화번호 없음",
+                    address=document.get("address_name") or "주소 없음",
+                    road_address=(
+                        document.get("road_address_name")
+                        or document.get("address_name")
+                        or "주소 없음"
+                    ),
+                    place_url=document.get("place_url") or "링크 없음",
+                    x=float(document["x"]) if document.get("x") else None,
+                    y=float(document["y"]) if document.get("y") else None,
+                )
+            )
+
+        return restaurants
+
+
 def validate_date(date_text: str) -> str:
     """YYYY-MM-DD 형식의 날짜인지 확인한다."""
 
@@ -54,7 +176,7 @@ def validate_date(date_text: str) -> str:
 def load_api_key(variable_name: str) -> str:
     """환경변수에서 API 키를 안전하게 불러온다."""
 
-    load_dotenv()
+    load_dotenv(dotenv_path=Path(".env"), override=True)
     api_key = os.getenv(variable_name)
 
     if not api_key:
@@ -199,57 +321,15 @@ Kakao 음식점 검색 결과:
     return response.text.strip()
 
 
-def search_restaurants(city: str) -> list[Restaurant]:
-    """추천 도시의 음식점 5곳을 Kakao Local API로 검색한다."""
+def search_restaurants(
+    city: str,
+    adapter: MapSearchAdapter | None = None,
+) -> list[Restaurant]:
+    """주입된 지도 어댑터로 음식점을 검색한다."""
 
-    kakao_api_key = load_api_key("KAKAO_REST_API_KEY")
-    url = "https://dapi.kakao.com/v2/local/search/keyword.json"
-    headers = {"Authorization": f"KakaoAK {kakao_api_key}"}
-    params = {
-        "query": f"{city} 맛집",
-        "category_group_code": "FD6",
-        "size": 5,
-        "sort": "accuracy",
-    }
+    search_adapter = adapter or KakaoLocalAdapter()
+    return search_adapter.search_restaurants(city)
 
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=10,
-        )
-        response.raise_for_status()
-    except requests.RequestException as error:
-        raise RuntimeError(
-            f"Kakao Local API 요청에 실패했습니다: {error}"
-        ) from error
-
-    documents = response.json().get("documents", [])
-    restaurants: list[Restaurant] = []
-
-    for document in documents:
-        restaurants.append(
-            Restaurant(
-                name=document.get("place_name", "이름 없음"),
-                category=document.get("category_name", "분류 없음"),
-                phone=document.get("phone") or "전화번호 없음",
-                address=document.get("address_name") or "주소 없음",
-                road_address=(
-                    document.get("road_address_name")
-                    or document.get("address_name")
-                    or "주소 없음"
-                ),
-                place_url=document.get("place_url") or "링크 없음",
-                x=float(document["x"]) if document.get("x") else None,
-                y=float(document["y"]) if document.get("y") else None,               
-            )
-        )
-
-    if not restaurants:
-        return []
-
-    return restaurants
 
 def load_cached_results(
     travel_date: str,
@@ -476,16 +556,22 @@ def main() -> None:
             client = create_gemini_client()
             recommendation = recommend_destination(client, args.date)
             city = recommendation.recommended_city
-            print(f"\nKakao에서 '{city} 맛집'을 검색하고 있습니다.")
+            search_city = normalize_city_keyword(city)
+            print(
+                f"\n추천 지역 '{city}'을(를) "
+                f"검색 키워드 '{search_city}'(으)로 정규화했습니다."
+            )
+            print(f"Kakao에서 '{search_city} 맛집'을 검색하고 있습니다.")
 
             try:
-                restaurants = search_restaurants(city)
+                map_adapter: MapSearchAdapter = KakaoLocalAdapter()
+                restaurants = search_restaurants(city, map_adapter)
                 if not restaurants:
                     errors.append(
                         {
                             "step": "place_search",
                             "type": "EMPTY_RESULT",
-                            "message": f"0 results for query={city} 맛집",
+                            "message": f"0 results for query={search_city} 맛집",
                         }
                     )
                     print("검색 결과가 0건입니다.")
@@ -529,7 +615,7 @@ def main() -> None:
 
         print_recommendation(recommendation)
         print_restaurants(
-            recommendation.recommended_city,
+            normalize_city_keyword(recommendation.recommended_city),
             restaurants,
         )
         json_path, markdown_path = save_results(
